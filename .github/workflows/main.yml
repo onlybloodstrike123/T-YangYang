@@ -1,0 +1,244 @@
+name: Templar GKI 5.10 Stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_name:
+        description: 'Nama Kernel (Final)'
+        required: true
+        default: 'Zixine'
+        type: string
+      release_status:
+        description: 'Status Rilis'
+        required: true
+        type: choice
+        default: 'RELEASE'
+        options:
+          - 'RELEASE'
+          - 'BETA'
+      force_clean:
+        description: 'Paksa Download Ulang (Reset Cache)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Templar GKI 5.10 Stable
+    runs-on: ubuntu-24.04
+
+    env:
+      BUILD_CONFIG: build.config.gki.aarch64
+      KERNELSU_REPO: https://github.com/RapliVx/KernelSU.git
+      KERNEL_NAME: ${{ inputs.kernel_name }}
+      RELEASE_STATUS: ${{ inputs.release_status }}
+
+    steps:
+      - name: Checkout Kernel
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc \
+            bison \
+            build-essential \
+            cpio \
+            flex \
+            git \
+            libelf-dev \
+            libssl-dev \
+            pahole \
+            python3 \
+            rsync \
+            unzip \
+            zip
+
+      - name: Reset build
+        if: ${{ inputs.force_clean }}
+        run: |
+          rm -rf out
+          rm -rf kernel-config
+          rm -rf .cache
+          git clean -fdx -e .github
+
+      - name: Check source
+        run: |
+          echo "Kernel: ${KERNEL_NAME}"
+          echo "Status: ${RELEASE_STATUS}"
+          echo "Build config: ${BUILD_CONFIG}"
+
+          git describe --always --dirty || true
+
+          grep -E \
+            '^(BRANCH|KMI_GENERATION|LLVM|CLANG_PREBUILT_BIN|HERMETIC_TOOLCHAIN)' \
+            build.config.common || true
+
+      - name: Setup RapliVx KernelSU
+        run: |
+          curl -LSs \
+            "https://raw.githubusercontent.com/RapliVx/KernelSU/master/kernel/setup.sh" \
+            | bash
+
+          git -C KernelSU describe --tags --always || true
+
+      - name: Create stable config fragment
+        run: |
+          mkdir -p kernel-config
+
+          cat > kernel-config/stable.config <<'EOF'
+          CONFIG_HZ_500=y
+          CONFIG_HZ=500
+          # CONFIG_HZ_100 is not set
+          # CONFIG_HZ_250 is not set
+          # CONFIG_HZ_300 is not set
+          CONFIG_KSU=y
+          CONFIG_KSU_SYSCALL_HOOK=y
+          CONFIG_KPROBES=y
+          CONFIG_KRETPROBES=y
+          CONFIG_HAVE_SYSCALL_TRACEPOINTS=y
+          CONFIG_LTO_CLANG=y
+          CONFIG_LTO_CLANG_THIN=y
+          # CONFIG_LTO_CLANG_FULL is not set
+          EOF
+
+          cat kernel-config/stable.config
+
+      - name: Build kernel
+        run: |
+          export GKI_DEFCONFIG_FRAGMENT="$GITHUB_WORKSPACE/kernel-config/stable.config"
+          ./build/build.sh
+
+      - name: Verify kernel configuration
+        run: |
+          CONFIG_FILE=$(find out -name .config -type f | head -n 1)
+
+          if [ -z "$CONFIG_FILE" ]; then
+            echo "ERROR: .config not found"
+            exit 1
+          fi
+
+          echo "Using: $CONFIG_FILE"
+
+          echo "HZ:"
+          grep -E '^CONFIG_HZ(_500)?=' "$CONFIG_FILE" || true
+
+          echo "LTO:"
+          grep -E '^CONFIG_LTO' "$CONFIG_FILE" || true
+
+          echo "KernelSU:"
+          grep -E '^CONFIG_KSU' "$CONFIG_FILE" || true
+
+      - name: Collect kernel artifacts
+        run: |
+          mkdir -p artifacts
+
+          IMAGE=$(find . \
+            -type f \
+            -name "Image.lz4" \
+            -not -path "./.git/*" \
+            | head -n 1)
+
+          if [ -z "$IMAGE" ]; then
+            echo "ERROR: Image.lz4 not found!"
+            exit 1
+          fi
+
+          cp "$IMAGE" "artifacts/${KERNEL_NAME}-${RELEASE_STATUS}-Image.lz4"
+
+          IMAGE_RAW=$(find . \
+            -type f \
+            -name "Image" \
+            -not -path "./.git/*" \
+            | head -n 1 || true)
+
+          if [ -n "$IMAGE_RAW" ]; then
+            cp "$IMAGE_RAW" "artifacts/${KERNEL_NAME}-${RELEASE_STATUS}-Image"
+          fi
+
+          VMLINUX=$(find . \
+            -type f \
+            -name "vmlinux" \
+            -not -path "./.git/*" \
+            | head -n 1 || true)
+
+          if [ -n "$VMLINUX" ]; then
+            cp "$VMLINUX" "artifacts/${KERNEL_NAME}-${RELEASE_STATUS}-vmlinux"
+          fi
+
+          echo "Artifacts:"
+          ls -lh artifacts/
+          
+      - name: Clone AnyKernel3
+        run: |
+          git clone --depth=1 \
+            https://github.com/osm0sis/AnyKernel3.git \
+            AnyKernel3
+
+      - name: Prepare AnyKernel3
+        run: |
+          rm -rf AnyKernel3/.git
+          rm -rf AnyKernel3/patch
+          rm -rf AnyKernel3/ramdisk
+
+          cp "artifacts/${KERNEL_NAME}-${RELEASE_STATUS}-Image.lz4" \
+            AnyKernel3/Image.lz4
+
+          cat > AnyKernel3/anykernel.sh <<EOF
+          properties() {
+            kernel.string=${KERNEL_NAME} ${RELEASE_STATUS}
+            do.devicecheck=0
+            do.modules=0
+            do.systemless=1
+            do.cleanup=1
+            do.cleanuponabort=0
+          }
+
+          block=auto;
+          is_slot_device=auto;
+          ramdisk_compression=auto;
+
+          . tools/ak3-core.sh;
+          dump_boot;
+          split_boot;
+          flash_boot;
+          flash_dtbo;
+          EOF
+
+      - name: Create AnyKernel3 ZIP
+        run: |
+          cd AnyKernel3
+
+          zip -r9 \
+            "../artifacts/${KERNEL_NAME}-${RELEASE_STATUS}-HZ500-AnyKernel3.zip" \
+            . \
+            -x "*.git*" \
+            -x "README.md"
+
+      - name: List final artifacts
+        run: |
+          echo "Final kernel:"
+          ls -lh artifacts/
+
+      - name: Upload AnyKernel3
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}-${{ inputs.release_status }}-AnyKernel3
+          path: artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload stable kernel
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.kernel_name }}-${{ inputs.release_status }}-HZ500
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14
