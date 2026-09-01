@@ -111,10 +111,25 @@ jobs:
 
           cat kernel-config/stable.config
 
-      - name: Build kernel
+      - name: Locate build system
         run: |
-          export GKI_DEFCONFIG_FRAGMENT="$GITHUB_WORKSPACE/kernel-config/stable.config"
-          ./build/build.sh
+          echo "Searching build scripts..."
+
+          find . -maxdepth 4 \
+            -type f \
+            \( \
+              -name "build.sh" \
+              -o -name "build_kernel.sh" \
+              -o -name "*.sh" \
+            \) \
+            -print | sort
+
+          echo
+          echo "Build config files:"
+          find . -maxdepth 3 \
+            -type f \
+            -name "build.config*" \
+            -print | sort
 
       - name: Verify kernel configuration
         run: |
